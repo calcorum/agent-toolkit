@@ -131,10 +131,34 @@ parse_body_args() {
   fi
 }
 
+# Shape-tolerant jq extractors for tea's user/assignee/label fields.
+#
+# tea reports these three different ways depending on which subcommand produced
+# the JSON:
+#   - REST-shaped paths (`tea api`, the comment endpoints) return *objects* with
+#     .login / .name;
+#   - `tea issues <N> --output json` returns assignees as an array of bare login
+#     *strings* (labels stay objects);
+#   - `tea issues list --fields ...` flattens both to a single comma-joined
+#     *string* per row.
+#
+# jq's `//` cannot paper over the difference. Indexing a string — `"cal" | .login`
+# — is a hard error, not null, so the alternative operator never gets to run and
+# the whole filter aborts. The type has to be tested first. This is exactly what
+# broke `issue show` on every *assigned* Gitea issue ("Cannot index string with
+# string \"login\"") while unassigned ones passed, because an empty array never
+# reaches the `.login`.
+#
+# Spliced into the single-quoted filters below with '"$VAR"' so the surrounding
+# jq stays literal.
+JQ_GITEA_ASSIGNEES='(if (.assignees | type) == "array" then [.assignees[] | if type == "object" then (.login // empty) else . end] elif (.assignees | type) == "string" and .assignees != "" then [.assignees] else [] end)'
+JQ_GITEA_LABELS='(if (.labels | type) == "array" then [.labels[] | if type == "object" then (.name // empty) else . end] elif (.labels | type) == "string" and .labels != "" then [.labels] else [] end)'
+JQ_GITEA_USER='(if (.user | type) == "object" then (.user.login // "") elif (.user | type) == "string" and .user != "" then .user elif (.author | type) == "object" then (.author.login // "") else (.author // "") end)'
+
 # jq filter normalizing a single comment object. GitHub and Gitea both return
 # REST-shaped comments with the same field names (id, body, html_url, user,
 # created_at), so one filter serves both backends for add/list/edit.
-COMMENT_JQ='{id, author: (.user.login // .user // ""), body, html_url: (.html_url // ""), created_at}'
+COMMENT_JQ='{id, author: '"$JQ_GITEA_USER"', body, html_url: (.html_url // ""), created_at}'
 
 # Emit {number, url} JSON from a create command's human output by scraping the
 # first issue/PR URL it printed. Used by issue/pr create so write commands return
@@ -216,10 +240,10 @@ normalize_gitea_issue() {
     title:      .title,
     body:       (.body // ""),
     state:      .state,
-    author:     (.user // .author // ""),
-    labels:     (if .labels then (.labels | if type == "array" then [.[].name // .] else [] end) else [] end),
+    author:     '"$JQ_GITEA_USER"',
+    labels:     '"$JQ_GITEA_LABELS"',
     milestone:  (.milestone // null),
-    assignees:  (if .assignees then (.assignees | if type == "array" then [.[] | .login // empty] else [] end) else [] end),
+    assignees:  '"$JQ_GITEA_ASSIGNEES"',
     created_at: (.created // .created_at // ""),
     updated_at: (.updated // .updated_at // null),
     url:        (.url // ""),
@@ -254,8 +278,8 @@ normalize_gitea_pr() {
     author:     (.author // ""),
     head:       (.head // ""),
     base:       (.base // ""),
-    labels:     (if .labels then (.labels | if type == "array" then [.[].name // .] else [] end) else [] end),
-    assignees:  (if .assignees then (.assignees | if type == "array" then [.[] | .login // empty] else [] end) else [] end),
+    labels:     '"$JQ_GITEA_LABELS"',
+    assignees:  '"$JQ_GITEA_ASSIGNEES"',
     mergeable:  (.mergeable // null),
     created_at: (.created // ""),
     updated_at: (.updated // null),
@@ -422,7 +446,7 @@ case "$cmd:$sub" in
               --fields "index,title,body,state,labels,milestone,comments,created,updated,assignees,url")
         [[ -n "$assignee" ]] && args+=(--assignee "$assignee")
         [[ -n "$label"    ]] && args+=(--labels "$label")
-        cli_json '[.[] | {number: (.index | tonumber? // .index), title, body: (.body // ""), state, author: (.author // ""), labels: (if .labels and (.labels | type) == "array" then [.labels[].name] elif .labels and (.labels | type) == "string" and .labels != "" then [.labels] else [] end), milestone: (.milestone // null), assignees: (if .assignees and (.assignees | type) == "array" then [.assignees[].login] elif .assignees and (.assignees | type) == "string" and .assignees != "" then [.assignees] else [] end), created_at: (.created // ""), updated_at: (.updated // null), url: (.url // "")}]' \
+        cli_json '[.[] | {number: (.index | tonumber? // .index), title, body: (.body // ""), state, author: (.author // ""), labels: '"$JQ_GITEA_LABELS"', milestone: (.milestone // null), assignees: '"$JQ_GITEA_ASSIGNEES"', created_at: (.created // ""), updated_at: (.updated // null), url: (.url // "")}]' \
           env NO_COLOR=1 tea issues list "${args[@]}"
         ;;
     esac
@@ -438,7 +462,7 @@ case "$cmd:$sub" in
           --json "number,title,body,state,author,labels,milestone,assignees,createdAt,updatedAt,url,closedAt,comments"
         ;;
       gitea)
-        cli_json '{number: (.index | tonumber? // .index), title, body: (.body // ""), state, author: (.user // ""), labels: (if .labels and (.labels | type) == "array" then [.labels[].name] else [] end), milestone: null, assignees: (if .assignees and (.assignees | type) == "array" then [.assignees[] | .login // empty] else [] end), created_at: (.created // ""), updated_at: null, url: (.url // ""), closed_at: (.closedAt // null), comments: (if .comments and (.comments | type) == "array" then [.comments[] | {author: (.user.login // .user // ""), body, created_at: (.created // "")}] else [] end)}' \
+        cli_json '{number: (.index | tonumber? // .index), title, body: (.body // ""), state, author: '"$JQ_GITEA_USER"', labels: '"$JQ_GITEA_LABELS"', milestone: null, assignees: '"$JQ_GITEA_ASSIGNEES"', created_at: (.created // ""), updated_at: null, url: (.url // ""), closed_at: (.closedAt // null), comments: (if (.comments | type) == "array" then [.comments[] | {author: '"$JQ_GITEA_USER"', body, created_at: (.created // "")}] else [] end)}' \
           env NO_COLOR=1 tea issues "$num" --output json
         ;;
     esac
@@ -580,7 +604,7 @@ case "$cmd:$sub" in
               --fields "index,title,body,state,author,head,base,labels,assignees,mergeable,created,updated,url")
         [[ "$state" == "merged" ]] && state="closed"
         args+=(--state "$state")
-        cli_json '[.[] | {number: (.index | tonumber? // .index), title, body: (.body // ""), state, merged: (.merged // false), author: (.author // ""), head: (.head // ""), base: (.base // ""), labels: (if .labels and (.labels | type) == "array" then [.labels[].name] else [] end), assignees: (if .assignees and (.assignees | type) == "array" then [.assignees[] | .login // empty] else [] end), mergeable: (.mergeable // null), created_at: (.created // ""), updated_at: (.updated // null), url: (.url // "")}]' \
+        cli_json '[.[] | {number: (.index | tonumber? // .index), title, body: (.body // ""), state, merged: (.merged // false), author: (.author // ""), head: (.head // ""), base: (.base // ""), labels: '"$JQ_GITEA_LABELS"', assignees: '"$JQ_GITEA_ASSIGNEES"', mergeable: (.mergeable // null), created_at: (.created // ""), updated_at: (.updated // null), url: (.url // "")}]' \
           env NO_COLOR=1 tea pr list "${args[@]}"
         ;;
     esac
@@ -612,7 +636,7 @@ case "$cmd:$sub" in
         ;;
       gitea)
         # tea has no single-PR view command; get from list filtered by number
-        cli_json "[.[] | select((.index | tonumber? // .index) == ${num})] | first | {number: (.index | tonumber? // .index), title, body: (.body // \"\"), state, merged: (.merged // false), author: (.author // \"\"), head: (.head // \"\"), base: (.base // \"\"), labels: (if .labels and (.labels | type) == \"array\" then [.labels[].name] else [] end), assignees: (if .assignees and (.assignees | type) == \"array\" then [.assignees[] | .login // empty] else [] end), mergeable: (.mergeable // null), created_at: (.created // \"\"), updated_at: (.updated // null), url: (.url // \"\"), comments: []}" \
+        cli_json "[.[] | select((.index | tonumber? // .index) == ${num})] | first | {number: (.index | tonumber? // .index), title, body: (.body // \"\"), state, merged: (.merged // false), author: (.author // \"\"), head: (.head // \"\"), base: (.base // \"\"), labels: ${JQ_GITEA_LABELS}, assignees: ${JQ_GITEA_ASSIGNEES}, mergeable: (.mergeable // null), created_at: (.created // \"\"), updated_at: (.updated // null), url: (.url // \"\"), comments: []}" \
           env NO_COLOR=1 tea pr list --output json --state all --limit 200 \
           --fields "index,title,body,state,author,head,base,labels,assignees,mergeable,created,updated,url"
         ;;
